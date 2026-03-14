@@ -10,6 +10,7 @@ from app.core.config import get_settings
 from app.api.routes import router
 from app.api.websocket import router as ws_router
 from app.api.llm_routes import router as llm_router
+from app.api.pose_routes import router as pose_router
 
 # Configure logging
 logging.basicConfig(
@@ -38,6 +39,11 @@ async def lifespan(app: FastAPI):
     from app.services.video_processor import _processor
     if _processor:
         _processor.close()
+    
+    # Unload pose models
+    from app.ml.pose_models import get_pose_model_registry
+    registry = get_pose_model_registry()
+    registry.unload_all()
 
 
 def create_app() -> FastAPI:
@@ -68,6 +74,9 @@ def create_app() -> FastAPI:
     
     # Include LLM management routes
     app.include_router(llm_router)
+    
+    # Include pose model management routes
+    app.include_router(pose_router)
     
     # Root endpoint
     @app.get("/")

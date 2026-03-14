@@ -1,8 +1,12 @@
-# FMS Automation Backend
-FROM python:3.11-slim
+# FMS Automation Backend - GPU Version
+# Use this for systems with NVIDIA GPU support
+FROM nvidia/cuda:12.1-runtime-ubuntu22.04
 
-# Install system dependencies for OpenCV, MediaPipe, and YOLO
+# Install Python and system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-venv \
+    python3-pip \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
@@ -14,17 +18,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
+# Set Python 3.11 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+
 WORKDIR /app
 
 # Install Python dependencies
 COPY requirements.txt .
 
-# Install PyTorch CPU version from specific index
-RUN pip install --no-cache-dir torch==2.2.0+cpu torchvision==0.17.0+cpu \
-    --index-url https://download.pytorch.org/whl/cpu
+# Install PyTorch GPU version
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
-# Install remaining dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install ONNX Runtime with CUDA support
+RUN pip install --no-cache-dir onnxruntime-gpu
+
+# Install remaining dependencies (skip onnxruntime as we have GPU version)
+RUN grep -v onnxruntime requirements.txt > requirements_filtered.txt \
+    && pip install --no-cache-dir -r requirements_filtered.txt
 
 # Copy application code
 COPY app ./app
@@ -32,10 +43,10 @@ COPY app ./app
 # Create data and model directories
 RUN mkdir -p /app/data/uploads /app/models/mediapipe /app/models/rtmpose /app/models/yolo
 
-# Pre-download YOLO pose models for faster startup (optional, can be removed to reduce image size)
-# These are downloaded on first use if not present
+# Pre-download YOLO pose models
 RUN python -c "from ultralytics import YOLO; YOLO('yolo11n-pose.pt')" || true
 RUN python -c "from ultralytics import YOLO; YOLO('yolo11s-pose.pt')" || true
+RUN python -c "from ultralytics import YOLO; YOLO('yolo11m-pose.pt')" || true
 
 # Environment
 ENV PYTHONUNBUFFERED=1
@@ -45,6 +56,9 @@ ENV FMS_PORT=8000
 # Model cache directory
 ENV TORCH_HOME=/app/models
 ENV MPLCONFIGDIR=/tmp/matplotlib
+
+# Enable GPU by default
+ENV FMS_POSE_PREFER_GPU=true
 
 EXPOSE 8000
 

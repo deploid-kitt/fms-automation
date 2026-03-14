@@ -10,8 +10,11 @@ opencv-python-headless==4.9.0.80
 numpy==1.26.4
 Pillow==10.2.0
 
-# Pose Estimation
+# Pose Estimation - MediaPipe
 mediapipe==0.10.11
+
+# Pose Estimation - YOLO (Ultralytics)
+ultralytics>=8.1.0
 
 # ML / Deep Learning (CPU)
 torch==2.2.0+cpu

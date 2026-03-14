@@ -12,7 +12,8 @@ from app.core.config import get_settings
 from app.models.schemas import (
     VideoMetadata, FMSReport, TestScore, JobStatus, FMSTest
 )
-from app.ml.pose_estimator import PoseEstimator, landmarks_to_array
+from app.ml.pose_estimator import landmarks_to_array
+from app.ml.pose_models import get_pose_model_registry, BasePoseEstimator
 from app.ml.exercise_classifier import RuleBasedClassifier
 from app.ml.fms_scorer import FMSScorer
 
@@ -22,9 +23,16 @@ logger = logging.getLogger(__name__)
 class VideoProcessor:
     """Process videos for FMS analysis."""
     
-    def __init__(self):
+    def __init__(self, pose_model_id: Optional[str] = None):
         self.settings = get_settings()
-        self.pose_estimator = PoseEstimator()
+        
+        # Get pose estimator from registry (prefer upload-optimized model)
+        self.registry = get_pose_model_registry()
+        if pose_model_id:
+            self.pose_estimator = self.registry.get_model(pose_model_id)
+        else:
+            self.pose_estimator = self.registry.get_model_for_mode("upload")
+        
         self.classifier = RuleBasedClassifier()
         self.scorer = FMSScorer()
     
@@ -66,7 +74,12 @@ class VideoProcessor:
         metadata = self.get_video_metadata(video_path)
         
         logger.info(f"Extracting poses from {video_path.name}: "
-                   f"{metadata.total_frames} frames")
+                   f"{metadata.total_frames} frames "
+                   f"(model: {self.pose_estimator.config.model_id if self.pose_estimator else 'none'})")
+        
+        if not self.pose_estimator:
+            logger.error("No pose estimator available")
+            return poses
         
         for i, pose_data in enumerate(self.pose_estimator.process_video(
             video_path,
@@ -376,7 +389,17 @@ class VideoProcessor:
     
     def close(self):
         """Release resources."""
-        self.pose_estimator.close()
+        # Pose estimator is managed by registry, don't close it here
+        pass
+    
+    def switch_pose_model(self, model_id: str) -> bool:
+        """Switch to a different pose estimation model."""
+        new_model = self.registry.get_model(model_id)
+        if new_model is None:
+            logger.warning(f"Failed to load model: {model_id}")
+            return False
+        self.pose_estimator = new_model
+        return True
 
 
 # Singleton instance

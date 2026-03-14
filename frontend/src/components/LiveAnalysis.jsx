@@ -1,5 +1,7 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react'
 import ModelSettings from './ModelSettings'
+import PoseModelSettings from './PoseModelSettings'
+import PoseModelQuickSelect, { PoseModelIndicator } from './PoseModelQuickSelect'
 
 // WebSocket connection states
 const WS_STATE = {
@@ -256,6 +258,9 @@ export default function LiveAnalysis({ onBack }) {
   const [cameraError, setCameraError] = useState(null)
   const [showPerformance, setShowPerformance] = useState(true)
   const [showModelSettings, setShowModelSettings] = useState(false)
+  const [showPoseModelSettings, setShowPoseModelSettings] = useState(false)
+  const [currentPoseModel, setCurrentPoseModel] = useState(null)
+  const [showPoseModelSelect, setShowPoseModelSelect] = useState(false)
   
   // Performance metrics
   const [fps, setFps] = useState(0)
@@ -447,6 +452,18 @@ export default function LiveAnalysis({ onBack }) {
         prevSkeletonRef.current = null
         currentSkeletonRef.current = null
         targetSkeletonRef.current = null
+      } else if (data.type === 'model_switched') {
+        // Pose model was switched
+        if (data.success) {
+          setCurrentPoseModel(data.model_id)
+          console.log('Pose model switched to:', data.model_id)
+        } else {
+          console.error('Failed to switch model:', data.error)
+        }
+      } else if (data.type === 'models_list') {
+        // Received list of available pose models
+        setCurrentPoseModel(data.current_model)
+        console.log('Current pose model:', data.current_model)
       }
     }
     
@@ -546,6 +563,23 @@ export default function LiveAnalysis({ onBack }) {
     }
   }, [])
   
+  // Switch pose model via WebSocket
+  const switchPoseModel = useCallback(async (modelId) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'switch_model',
+        model_id: modelId
+      }))
+    }
+  }, [])
+  
+  // Request current pose model list
+  const requestPoseModels = useCallback(() => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'list_models' }))
+    }
+  }, [])
+  
   // Text-to-speech for audio cues (with rate limiting)
   const lastSpeakTimeRef = useRef(0)
   const speakCue = useCallback((text) => {
@@ -590,15 +624,18 @@ export default function LiveAnalysis({ onBack }) {
       await new Promise(resolve => setTimeout(resolve, 500))
     }
     
-    // Send start command
+    // Send start command and request current pose model
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({
         type: 'start',
         exercise: selectedExercise
       }))
       startFrameLoop()
+      
+      // Request current pose model info
+      requestPoseModels()
     }
-  }, [startCamera, connectWebSocket, selectedExercise, startFrameLoop])
+  }, [startCamera, connectWebSocket, selectedExercise, startFrameLoop, requestPoseModels])
   
   // Stop analysis
   const handleStop = useCallback(() => {
@@ -668,6 +705,15 @@ export default function LiveAnalysis({ onBack }) {
               className="text-xs text-gray-500 hover:text-gray-700"
             >
               {showPerformance ? 'Hide' : 'Show'} Stats
+            </button>
+            <button
+              onClick={() => setShowPoseModelSettings(true)}
+              className="text-gray-600 hover:text-gray-800 flex items-center gap-2"
+              title="Pose Model Settings"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />
+              </svg>
             </button>
             <button
               onClick={() => setShowModelSettings(true)}
@@ -765,7 +811,25 @@ export default function LiveAnalysis({ onBack }) {
                 visible={showPerformance}
               />
             )}
+            
+            {/* Pose Model Indicator */}
+            {isAnalyzing && currentPoseModel && (
+              <PoseModelIndicator
+                currentModelId={currentPoseModel}
+                onClick={() => setShowPoseModelSelect(!showPoseModelSelect)}
+              />
+            )}
           </div>
+          
+          {/* Pose Model Quick Select (shown when clicked) */}
+          {isAnalyzing && showPoseModelSelect && (
+            <div className="absolute top-16 left-4 z-10">
+              <PoseModelQuickSelect
+                currentModelId={currentPoseModel}
+                onModelChange={switchPoseModel}
+              />
+            </div>
+          )}
           
           {/* Score indicator */}
           {isAnalyzing && feedback && (
@@ -877,6 +941,19 @@ export default function LiveAnalysis({ onBack }) {
         onClose={() => setShowModelSettings(false)}
         onSave={(prefs) => {
           console.log('Model preferences saved:', prefs)
+        }}
+      />
+      
+      {/* Pose Model Settings Modal */}
+      <PoseModelSettings
+        isOpen={showPoseModelSettings}
+        onClose={() => setShowPoseModelSettings(false)}
+        onSave={(prefs) => {
+          console.log('Pose model preferences saved:', prefs)
+          // Reload current model if changed
+          if (prefs.live_model !== currentPoseModel) {
+            switchPoseModel(prefs.live_model)
+          }
         }}
       />
     </div>

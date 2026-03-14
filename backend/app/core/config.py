@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     pose_smoothing_enabled: bool = True  # Enable pose landmark smoothing
     pose_smoothing_factor: float = 0.5  # Smoothing factor (0=no smooth, 1=max smooth)
     
+    # Pose Model Settings
+    pose_model_live: str = "mediapipe-medium"  # Default model for live analysis
+    pose_model_upload: str = "rtmpose-large"  # Default model for upload analysis
+    pose_model_fallback: str = "mediapipe-medium"  # Fallback model
+    pose_prefer_gpu: bool = False  # Prefer GPU acceleration when available
+    
     # LLM Integration
     enable_llm_reports: bool = True
     enable_llm_coaching: bool = True

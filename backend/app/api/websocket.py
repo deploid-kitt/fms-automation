@@ -14,7 +14,8 @@ import cv2
 import numpy as np
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from app.ml.pose_estimator import PoseEstimator, landmarks_to_array, JointIdx
+from app.ml.pose_estimator import landmarks_to_array, JointIdx
+from app.ml.pose_models import get_pose_model_registry, BasePoseEstimator
 from app.ml.angle_calculator import AngleCalculator
 from app.ml.fms_scorer import FMSScorer, ScoringCriteria
 from app.core.config import get_settings
@@ -83,9 +84,18 @@ class LiveFeedback:
 class LiveAnalyzer:
     """Real-time FMS analysis engine with performance optimizations."""
     
-    def __init__(self, enable_llm: bool = True):
-        # Initialize pose estimator optimized for live analysis
-        self.pose_estimator = PoseEstimator(enable_smoothing=True, for_live=True)
+    def __init__(self, enable_llm: bool = True, pose_model_id: Optional[str] = None):
+        # Initialize pose estimator from registry
+        self.registry = get_pose_model_registry()
+        
+        # Use specified model or get model for live mode
+        if pose_model_id:
+            self.pose_estimator = self.registry.get_model(pose_model_id)
+        else:
+            self.pose_estimator = self.registry.get_model_for_mode("live")
+        
+        self.current_model_id = self.pose_estimator.config.model_id if self.pose_estimator else None
+        
         self.angle_calc = AngleCalculator()
         self.scorer = FMSScorer()
         self.criteria = ScoringCriteria()
@@ -107,6 +117,10 @@ class LiveAnalyzer:
         self.last_llm_cue: Optional[str] = None
         self.last_llm_model: Optional[str] = None
         self.last_llm_latency: float = 0
+        
+        # Model switching support
+        self._model_switch_requested: bool = False
+        self._new_model_id: Optional[str] = None
         
         # Session state
         self.session_id: Optional[str] = None
@@ -153,7 +167,8 @@ class LiveAnalyzer:
         self.process_times.clear()
         
         # Reset pose smoother for new session
-        self.pose_estimator.reset_smoother()
+        if self.pose_estimator:
+            self.pose_estimator.reset_state()
         
         # Reset LLM state
         self.last_llm_cue_time = 0
@@ -164,8 +179,42 @@ class LiveAnalyzer:
         if self.llm_service:
             self.llm_service.clear_cue_history()
         
-        logger.info(f"Started live session {self.session_id} for {exercise} (LLM: {self.enable_llm})")
+        logger.info(f"Started live session {self.session_id} for {exercise} (LLM: {self.enable_llm}, model: {self.current_model_id})")
         return self.session_id
+    
+    def switch_pose_model(self, model_id: str) -> bool:
+        """
+        Switch to a different pose estimation model.
+        
+        Args:
+            model_id: ID of the new model to use
+            
+        Returns:
+            True if switch was successful
+        """
+        new_model = self.registry.get_model(model_id)
+        if new_model is None:
+            logger.warning(f"Failed to load model: {model_id}")
+            return False
+        
+        # Swap model
+        old_model_id = self.current_model_id
+        self.pose_estimator = new_model
+        self.current_model_id = model_id
+        
+        # Reset state for new model
+        self.landmark_buffer.clear()
+        self.score_buffer.clear()
+        self.last_feedback = None
+        self.last_skeleton = []
+        
+        logger.info(f"Switched pose model: {old_model_id} -> {model_id}")
+        return True
+    
+    def get_available_pose_models(self) -> list[dict]:
+        """Get list of available pose models."""
+        models = self.registry.get_available_models()
+        return [m.to_dict() for m in models]
     
     async def _generate_llm_cue_async(
         self,
@@ -301,9 +350,25 @@ class LiveAnalyzer:
         # Full processing for this frame
         self.processed_frame_count += 1
         
+        # Check if pose estimator is available
+        if not self.pose_estimator:
+            feedback = self._no_pose_feedback(elapsed)
+            feedback.primary_cue = "Pose model not loaded"
+            feedback.server_timestamp = time.time()
+            feedback.frame_sequence = frame_sequence
+            self.last_feedback = feedback
+            return feedback
+        
         # Extract pose with downscaling for performance
-        pose_data = self.pose_estimator.process_frame(frame, downscale=True)
-        pose_process_ms = pose_data.get("process_time_ms", 0) if pose_data else 0
+        pose_result = self.pose_estimator.process_frame(frame, downscale=True)
+        
+        # Handle new PoseLandmarks return type
+        if pose_result is None:
+            pose_data = None
+            pose_process_ms = 0
+        else:
+            pose_data = pose_result.to_dict()
+            pose_process_ms = pose_result.process_time_ms
         
         if not pose_data or not pose_data.get("landmarks"):
             feedback = self._no_pose_feedback(elapsed)
@@ -345,7 +410,7 @@ class LiveAnalyzer:
     def get_performance_stats(self) -> dict:
         """Get analyzer performance statistics."""
         avg_process_time = sum(self.process_times) / len(self.process_times) if self.process_times else 0
-        pose_stats = self.pose_estimator.get_performance_stats()
+        pose_stats = self.pose_estimator.get_stats() if self.pose_estimator else {}
         
         return {
             "frames_received": self.frame_count,
@@ -353,7 +418,8 @@ class LiveAnalyzer:
             "frame_skip_ratio": self.frame_skip,
             "avg_process_time_ms": avg_process_time,
             "effective_fps": 1000 / avg_process_time if avg_process_time > 0 else 0,
-            "pose_estimator": pose_stats
+            "pose_estimator": pose_stats,
+            "current_model_id": self.current_model_id,
         }
     
     def _no_pose_feedback(self, elapsed: float) -> LiveFeedback:
@@ -784,7 +850,8 @@ class LiveAnalyzer:
     
     def close(self):
         """Clean up resources."""
-        self.pose_estimator.close()
+        # Note: Don't close pose_estimator as it's managed by the registry
+        pass
 
 
 # Connection manager for WebSocket sessions
@@ -911,6 +978,32 @@ async def live_analysis_websocket(websocket: WebSocket, session_id: str):
                 await websocket.send_json({
                     "type": "stats",
                     **stats
+                })
+            
+            elif msg_type == "switch_model":
+                # Switch pose estimation model
+                model_id = data.get("model_id", "")
+                if model_id:
+                    success = analyzer.switch_pose_model(model_id)
+                    await websocket.send_json({
+                        "type": "model_switched",
+                        "success": success,
+                        "model_id": model_id if success else analyzer.current_model_id,
+                        "error": None if success else f"Failed to load model: {model_id}"
+                    })
+                else:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "model_id is required"
+                    })
+            
+            elif msg_type == "list_models":
+                # List available pose models
+                models = analyzer.get_available_pose_models()
+                await websocket.send_json({
+                    "type": "models_list",
+                    "models": models,
+                    "current_model": analyzer.current_model_id
                 })
     
     except WebSocketDisconnect:

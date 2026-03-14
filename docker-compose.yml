@@ -33,6 +33,11 @@ services:
       FMS_LIVE_PROCESS_HEIGHT: "240"  # Downscale height for pose processing
       FMS_POSE_SMOOTHING_ENABLED: "true"
       FMS_POSE_SMOOTHING_FACTOR: "0.5"
+      # Multi-model pose settings
+      FMS_POSE_MODEL_LIVE: "mediapipe-medium"
+      FMS_POSE_MODEL_UPLOAD: "rtmpose-large"
+      FMS_POSE_MODEL_FALLBACK: "mediapipe-medium"
+      FMS_POSE_PREFER_GPU: "false"
     volumes:
       - uploads_data:/app/data/uploads
       - models_data:/app/models

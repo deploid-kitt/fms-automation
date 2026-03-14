@@ -1,11 +1,20 @@
-"""Pose estimation using MediaPipe BlazePose."""
+"""Pose estimation using MediaPipe BlazePose.
+
+DEPRECATED: This module is maintained for backward compatibility.
+Use app.ml.pose_models instead for multi-model support.
+"""
 import cv2
 import numpy as np
-import mediapipe as mp
 from typing import Generator, Optional
 from pathlib import Path
 import logging
 import time
+
+try:
+    import mediapipe as mp
+    HAS_MEDIAPIPE = True
+except ImportError:
+    HAS_MEDIAPIPE = False
 
 from app.core.config import get_settings
 
@@ -96,7 +105,11 @@ class PoseSmoother:
 
 
 class PoseEstimator:
-    """MediaPipe BlazePose wrapper for pose estimation."""
+    """MediaPipe BlazePose wrapper for pose estimation.
+    
+    DEPRECATED: Use pose_models.MediaPipePoseEstimator instead.
+    This class is maintained for backward compatibility.
+    """
     
     def __init__(self, enable_smoothing: bool = True, for_live: bool = False):
         """
@@ -106,6 +119,9 @@ class PoseEstimator:
             enable_smoothing: Enable landmark smoothing
             for_live: Optimize for live analysis (lower complexity)
         """
+        if not HAS_MEDIAPIPE:
+            raise ImportError("mediapipe is not installed")
+        
         settings = get_settings()
         self.settings = settings
         self.mp_pose = mp.solutions.pose
