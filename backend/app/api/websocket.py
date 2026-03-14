@@ -6,8 +6,9 @@ import logging
 import time
 import uuid
 from typing import Optional, Dict, Any
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from enum import Enum
+from collections import deque
 
 import cv2
 import numpy as np
@@ -17,9 +18,13 @@ from app.ml.pose_estimator import PoseEstimator, landmarks_to_array, JointIdx
 from app.ml.angle_calculator import AngleCalculator
 from app.ml.fms_scorer import FMSScorer, ScoringCriteria
 from app.core.config import get_settings
+from app.llm.fms_service import get_fms_llm_service, FMSLLMService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/ws", tags=["websocket"])
+
+# Performance settings
+settings = get_settings()
 
 
 class ExercisePhase(str, Enum):
@@ -62,33 +67,75 @@ class LiveFeedback:
     # Audio cue (if any)
     audio_cue: Optional[str] = None
     audio_priority: int = 0  # 0=none, 1=info, 2=warning, 3=critical
+    
+    # Performance metrics
+    server_process_ms: float = 0.0  # Server-side processing time
+    pose_process_ms: float = 0.0  # MediaPipe processing time
+    server_timestamp: float = 0.0  # Server timestamp for latency calculation
+    frame_sequence: int = 0  # Client frame sequence number for sync
+    
+    # LLM-enhanced feedback
+    llm_cue: Optional[str] = None  # LLM-generated coaching cue
+    llm_model: Optional[str] = None  # Model used for LLM cue
+    llm_latency_ms: float = 0.0  # LLM response latency
 
 
 class LiveAnalyzer:
-    """Real-time FMS analysis engine."""
+    """Real-time FMS analysis engine with performance optimizations."""
     
-    def __init__(self):
-        self.pose_estimator = PoseEstimator()
+    def __init__(self, enable_llm: bool = True):
+        # Initialize pose estimator optimized for live analysis
+        self.pose_estimator = PoseEstimator(enable_smoothing=True, for_live=True)
         self.angle_calc = AngleCalculator()
         self.scorer = FMSScorer()
         self.criteria = ScoringCriteria()
+        
+        # LLM service for enhanced coaching
+        self.enable_llm = enable_llm and settings.enable_llm_coaching
+        self.llm_service: Optional[FMSLLMService] = None
+        if self.enable_llm:
+            try:
+                self.llm_service = get_fms_llm_service()
+            except Exception as e:
+                logger.warning(f"Failed to initialize LLM service: {e}")
+                self.enable_llm = False
+        
+        # LLM cue generation state
+        self.last_llm_cue_time: float = 0
+        self.llm_cue_cooldown: float = 5.0  # Longer cooldown for LLM cues
+        self.pending_llm_task: Optional[asyncio.Task] = None
+        self.last_llm_cue: Optional[str] = None
+        self.last_llm_model: Optional[str] = None
+        self.last_llm_latency: float = 0
         
         # Session state
         self.session_id: Optional[str] = None
         self.current_exercise: str = "deep_squat"
         self.phase: ExercisePhase = ExercisePhase.IDLE
         self.frame_count: int = 0
+        self.processed_frame_count: int = 0
         self.start_time: float = 0
+        
+        # Frame skipping for performance
+        self.frame_skip = settings.live_frame_skip
         
         # Analysis buffers
         self.landmark_buffer: list[np.ndarray] = []
         self.score_buffer: list[int] = []
         self.max_buffer_size: int = 90  # ~3 seconds at 30fps
         
+        # Cached last feedback for frame skipping
+        self.last_feedback: Optional[LiveFeedback] = None
+        self.last_skeleton: list[dict] = []
+        
         # Feedback state
         self.last_audio_cue_time: float = 0
         self.audio_cue_cooldown: float = 2.0  # seconds between audio cues
         self.cue_history: list[str] = []
+        
+        # Performance tracking
+        self.process_times: deque = deque(maxlen=30)
+        self.last_process_time: float = 0
         
     def start_session(self, exercise: str = "deep_squat") -> str:
         """Start a new analysis session."""
@@ -96,32 +143,174 @@ class LiveAnalyzer:
         self.current_exercise = exercise
         self.phase = ExercisePhase.PREPARING
         self.frame_count = 0
+        self.processed_frame_count = 0
         self.start_time = time.time()
         self.landmark_buffer.clear()
         self.score_buffer.clear()
         self.cue_history.clear()
+        self.last_feedback = None
+        self.last_skeleton = []
+        self.process_times.clear()
         
-        logger.info(f"Started live session {self.session_id} for {exercise}")
+        # Reset pose smoother for new session
+        self.pose_estimator.reset_smoother()
+        
+        # Reset LLM state
+        self.last_llm_cue_time = 0
+        self.pending_llm_task = None
+        self.last_llm_cue = None
+        self.last_llm_model = None
+        self.last_llm_latency = 0
+        if self.llm_service:
+            self.llm_service.clear_cue_history()
+        
+        logger.info(f"Started live session {self.session_id} for {exercise} (LLM: {self.enable_llm})")
         return self.session_id
     
-    def process_frame(self, frame: np.ndarray) -> LiveFeedback:
+    async def _generate_llm_cue_async(
+        self,
+        exercise: str,
+        score: int,
+        form_quality: str,
+        faults: list[str],
+        metrics: dict,
+    ) -> None:
+        """
+        Asynchronously generate an LLM coaching cue.
+        
+        This runs in the background to avoid blocking frame processing.
+        """
+        if not self.llm_service:
+            return
+        
+        try:
+            result = await self.llm_service.generate_coaching_cue(
+                exercise=exercise,
+                score=score,
+                form_quality=form_quality,
+                faults=faults,
+                metrics=metrics,
+                timeout=settings.llm_realtime_timeout,
+            )
+            
+            if result.success:
+                self.last_llm_cue = result.cue
+                self.last_llm_model = result.model_used
+                self.last_llm_latency = result.latency_ms
+                self.last_llm_cue_time = time.time()
+                logger.debug(f"LLM cue generated: {result.cue} ({result.latency_ms:.0f}ms)")
+            else:
+                logger.debug(f"LLM cue failed: {result.error}")
+                
+        except Exception as e:
+            logger.warning(f"LLM cue generation error: {e}")
+    
+    def maybe_request_llm_cue(
+        self,
+        exercise: str,
+        score: int,
+        form_quality: str,
+        faults: list[str],
+        metrics: dict,
+    ) -> tuple[Optional[str], Optional[str], float]:
+        """
+        Request LLM cue if cooldown has passed and no pending request.
+        
+        Returns:
+            Tuple of (cached_cue, model_used, latency_ms) or (None, None, 0)
+        """
+        if not self.enable_llm or not self.llm_service:
+            return (None, None, 0)
+        
+        current_time = time.time()
+        
+        # Check if we have a recent LLM cue to return
+        if self.last_llm_cue and (current_time - self.last_llm_cue_time) < 10:
+            cue = self.last_llm_cue
+            model = self.last_llm_model
+            latency = self.last_llm_latency
+        else:
+            cue, model, latency = None, None, 0
+        
+        # Start new LLM request if cooldown passed and no pending request
+        if (current_time - self.last_llm_cue_time) > self.llm_cue_cooldown:
+            if self.pending_llm_task is None or self.pending_llm_task.done():
+                # Create async task for LLM cue generation
+                self.pending_llm_task = asyncio.create_task(
+                    self._generate_llm_cue_async(
+                        exercise=exercise,
+                        score=score,
+                        form_quality=form_quality,
+                        faults=faults,
+                        metrics=metrics,
+                    )
+                )
+        
+        return (cue, model, latency)
+    
+    def process_frame(
+        self, 
+        frame: np.ndarray,
+        client_timestamp: float = 0,
+        frame_sequence: int = 0
+    ) -> LiveFeedback:
         """
         Process a single frame and return real-time feedback.
         
         Args:
             frame: BGR image from webcam
+            client_timestamp: Client-side timestamp for latency tracking
+            frame_sequence: Client frame sequence number
             
         Returns:
             LiveFeedback with all analysis results
         """
+        process_start = time.perf_counter()
+        
         self.frame_count += 1
         elapsed = time.time() - self.start_time if self.start_time else 0
         
-        # Extract pose
-        pose_data = self.pose_estimator.process_frame(frame)
+        # Frame skipping: return cached feedback with interpolated skeleton
+        if self.frame_skip > 1 and self.frame_count % self.frame_skip != 0:
+            if self.last_feedback is not None:
+                # Return cached feedback with updated frame count and timestamps
+                cached = LiveFeedback(
+                    exercise=self.last_feedback.exercise,
+                    phase=self.last_feedback.phase,
+                    frame_count=self.frame_count,
+                    elapsed_seconds=elapsed,
+                    pose_detected=self.last_feedback.pose_detected,
+                    pose_confidence=self.last_feedback.pose_confidence,
+                    current_score=self.last_feedback.current_score,
+                    score_confidence=self.last_feedback.score_confidence,
+                    form_quality=self.last_feedback.form_quality,
+                    primary_cue=self.last_feedback.primary_cue,
+                    secondary_cues=self.last_feedback.secondary_cues,
+                    skeleton=self.last_skeleton,  # Use last known skeleton
+                    joint_angles=self.last_feedback.joint_angles,
+                    problem_joints=self.last_feedback.problem_joints,
+                    audio_cue=None,  # Don't repeat audio cues
+                    audio_priority=0,
+                    server_process_ms=0.1,  # Minimal processing
+                    pose_process_ms=0,
+                    server_timestamp=time.time(),
+                    frame_sequence=frame_sequence
+                )
+                return cached
+        
+        # Full processing for this frame
+        self.processed_frame_count += 1
+        
+        # Extract pose with downscaling for performance
+        pose_data = self.pose_estimator.process_frame(frame, downscale=True)
+        pose_process_ms = pose_data.get("process_time_ms", 0) if pose_data else 0
         
         if not pose_data or not pose_data.get("landmarks"):
-            return self._no_pose_feedback(elapsed)
+            feedback = self._no_pose_feedback(elapsed)
+            feedback.server_timestamp = time.time()
+            feedback.frame_sequence = frame_sequence
+            self.last_feedback = feedback
+            return feedback
         
         # Convert to numpy array
         landmarks = landmarks_to_array(pose_data["landmarks"])
@@ -137,7 +326,35 @@ class LiveAnalyzer:
         # Get exercise-specific analysis
         feedback = self._analyze_exercise(landmarks, elapsed, pose_confidence)
         
+        # Add performance metrics
+        process_end = time.perf_counter()
+        self.last_process_time = (process_end - process_start) * 1000
+        self.process_times.append(self.last_process_time)
+        
+        feedback.server_process_ms = self.last_process_time
+        feedback.pose_process_ms = pose_process_ms
+        feedback.server_timestamp = time.time()
+        feedback.frame_sequence = frame_sequence
+        
+        # Cache for frame skipping
+        self.last_feedback = feedback
+        self.last_skeleton = feedback.skeleton.copy()
+        
         return feedback
+    
+    def get_performance_stats(self) -> dict:
+        """Get analyzer performance statistics."""
+        avg_process_time = sum(self.process_times) / len(self.process_times) if self.process_times else 0
+        pose_stats = self.pose_estimator.get_performance_stats()
+        
+        return {
+            "frames_received": self.frame_count,
+            "frames_processed": self.processed_frame_count,
+            "frame_skip_ratio": self.frame_skip,
+            "avg_process_time_ms": avg_process_time,
+            "effective_fps": 1000 / avg_process_time if avg_process_time > 0 else 0,
+            "pose_estimator": pose_stats
+        }
     
     def _no_pose_feedback(self, elapsed: float) -> LiveFeedback:
         """Return feedback when no pose is detected."""
@@ -157,7 +374,11 @@ class LiveAnalyzer:
             joint_angles={},
             problem_joints=[],
             audio_cue="Please step back so I can see you" if self.frame_count % 60 == 0 else None,
-            audio_priority=2 if self.frame_count % 60 == 0 else 0
+            audio_priority=2 if self.frame_count % 60 == 0 else 0,
+            server_process_ms=0.0,
+            pose_process_ms=0.0,
+            server_timestamp=0.0,
+            frame_sequence=0
         )
     
     def _analyze_exercise(
@@ -272,6 +493,20 @@ class LiveAnalyzer:
         
         avg_score = round(sum(self.score_buffer) / len(self.score_buffer))
         
+        # Get LLM-enhanced coaching cue (async, non-blocking)
+        fault_descriptions = [c for c in cues + secondary_cues]
+        llm_cue, llm_model, llm_latency = self.maybe_request_llm_cue(
+            exercise=self.current_exercise,
+            score=avg_score,
+            form_quality=form_quality,
+            faults=fault_descriptions,
+            metrics={
+                "knee_flexion": knee_flex,
+                "knee_valgus": metrics["knee_valgus"],
+                "trunk_upright": metrics["trunk_upright"],
+            },
+        )
+        
         return LiveFeedback(
             exercise=self.current_exercise,
             phase=self.phase,
@@ -292,7 +527,10 @@ class LiveAnalyzer:
             },
             problem_joints=list(set(problem_joints)),
             audio_cue=audio_cue,
-            audio_priority=audio_priority
+            audio_priority=audio_priority,
+            llm_cue=llm_cue,
+            llm_model=llm_model,
+            llm_latency_ms=llm_latency,
         )
     
     def _analyze_aslr(
@@ -619,6 +857,9 @@ async def live_analysis_websocket(websocket: WebSocket, session_id: str):
             elif msg_type == "frame":
                 # Decode base64 frame
                 frame_data = data.get("data", "")
+                client_timestamp = data.get("timestamp", 0)
+                frame_sequence = data.get("sequence", 0)
+                
                 if frame_data.startswith("data:image"):
                     frame_data = frame_data.split(",")[1]
                 
@@ -628,8 +869,12 @@ async def live_analysis_websocket(websocket: WebSocket, session_id: str):
                     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     
                     if frame is not None:
-                        # Process frame
-                        feedback = analyzer.process_frame(frame)
+                        # Process frame with timing info
+                        feedback = analyzer.process_frame(
+                            frame,
+                            client_timestamp=client_timestamp,
+                            frame_sequence=frame_sequence
+                        )
                         await websocket.send_json({
                             "type": "feedback",
                             **asdict(feedback)
@@ -658,7 +903,15 @@ async def live_analysis_websocket(websocket: WebSocket, session_id: str):
                 break
             
             elif msg_type == "ping":
-                await websocket.send_json({"type": "pong"})
+                await websocket.send_json({"type": "pong", "timestamp": time.time()})
+            
+            elif msg_type == "stats":
+                # Return performance statistics
+                stats = analyzer.get_performance_stats()
+                await websocket.send_json({
+                    "type": "stats",
+                    **stats
+                })
     
     except WebSocketDisconnect:
         logger.info(f"Client disconnected: {session_id}")

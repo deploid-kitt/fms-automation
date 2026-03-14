@@ -5,6 +5,7 @@ import mediapipe as mp
 from typing import Generator, Optional
 from pathlib import Path
 import logging
+import time
 
 from app.core.config import get_settings
 
@@ -45,36 +46,138 @@ class JointIdx:
     RIGHT_FOOT_INDEX = 32
 
 
+class PoseSmoother:
+    """Smooth pose landmarks over time to reduce jitter."""
+    
+    def __init__(self, smoothing_factor: float = 0.5, num_landmarks: int = 33):
+        """
+        Initialize pose smoother.
+        
+        Args:
+            smoothing_factor: Weight for previous frame (0=no smoothing, 1=max)
+            num_landmarks: Number of pose landmarks
+        """
+        self.smoothing_factor = smoothing_factor
+        self.num_landmarks = num_landmarks
+        self.prev_landmarks: Optional[np.ndarray] = None
+        
+    def smooth(self, landmarks: np.ndarray) -> np.ndarray:
+        """
+        Apply exponential moving average smoothing to landmarks.
+        
+        Args:
+            landmarks: Current frame landmarks (33, 4) - x, y, z, visibility
+            
+        Returns:
+            Smoothed landmarks
+        """
+        if self.prev_landmarks is None:
+            self.prev_landmarks = landmarks.copy()
+            return landmarks
+        
+        # Apply smoothing only to x, y, z (not visibility)
+        smoothed = landmarks.copy()
+        alpha = 1.0 - self.smoothing_factor
+        
+        for i in range(self.num_landmarks):
+            # Only smooth if both current and previous have good visibility
+            if landmarks[i, 3] > 0.5 and self.prev_landmarks[i, 3] > 0.5:
+                smoothed[i, :3] = (
+                    alpha * landmarks[i, :3] + 
+                    self.smoothing_factor * self.prev_landmarks[i, :3]
+                )
+        
+        self.prev_landmarks = smoothed.copy()
+        return smoothed
+    
+    def reset(self):
+        """Reset smoother state."""
+        self.prev_landmarks = None
+
+
 class PoseEstimator:
     """MediaPipe BlazePose wrapper for pose estimation."""
     
-    def __init__(self):
-        """Initialize pose estimator."""
+    def __init__(self, enable_smoothing: bool = True, for_live: bool = False):
+        """
+        Initialize pose estimator.
+        
+        Args:
+            enable_smoothing: Enable landmark smoothing
+            for_live: Optimize for live analysis (lower complexity)
+        """
         settings = get_settings()
+        self.settings = settings
         self.mp_pose = mp.solutions.pose
+        
+        # Use lower model complexity for live analysis
+        model_complexity = settings.pose_model_complexity
+        if for_live and model_complexity > 1:
+            model_complexity = 1  # Use "full" instead of "heavy" for real-time
+            
         self.pose = self.mp_pose.Pose(
             static_image_mode=False,
-            model_complexity=settings.pose_model_complexity,
+            model_complexity=model_complexity,
             enable_segmentation=False,
+            smooth_landmarks=True,  # MediaPipe's built-in smoothing
             min_detection_confidence=settings.min_detection_confidence,
             min_tracking_confidence=settings.min_tracking_confidence
         )
         
-    def process_frame(self, frame: np.ndarray) -> Optional[dict]:
+        # Additional smoothing
+        self.smoother = PoseSmoother(
+            smoothing_factor=settings.pose_smoothing_factor
+        ) if enable_smoothing and settings.pose_smoothing_enabled else None
+        
+        # Performance tracking
+        self.last_process_time: float = 0
+        self.avg_process_time: float = 0
+        self.frame_count: int = 0
+        
+    def process_frame(
+        self, 
+        frame: np.ndarray,
+        downscale: bool = False
+    ) -> Optional[dict]:
         """
         Process a single frame and extract pose landmarks.
         
         Args:
             frame: BGR image from OpenCV
+            downscale: Whether to downscale frame for faster processing
             
         Returns:
             Dictionary with landmarks data or None if no pose detected
         """
+        start_time = time.perf_counter()
+        
+        # Optionally downscale for faster processing
+        process_frame = frame
+        if downscale:
+            target_w = self.settings.live_process_width
+            target_h = self.settings.live_process_height
+            h, w = frame.shape[:2]
+            if w > target_w or h > target_h:
+                process_frame = cv2.resize(
+                    frame, 
+                    (target_w, target_h),
+                    interpolation=cv2.INTER_LINEAR
+                )
+        
         # Convert BGR to RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb_frame = cv2.cvtColor(process_frame, cv2.COLOR_BGR2RGB)
         
         # Process frame
         results = self.pose.process(rgb_frame)
+        
+        # Track processing time
+        self.last_process_time = time.perf_counter() - start_time
+        self.frame_count += 1
+        # Exponential moving average
+        self.avg_process_time = (
+            0.9 * self.avg_process_time + 0.1 * self.last_process_time
+            if self.avg_process_time > 0 else self.last_process_time
+        )
         
         if not results.pose_landmarks:
             return None
@@ -88,6 +191,15 @@ class PoseEstimator:
                 "z": lm.z,
                 "visibility": lm.visibility
             })
+        
+        # Apply smoothing if enabled
+        if self.smoother is not None:
+            landmarks_array = landmarks_to_array(landmarks)
+            smoothed_array = self.smoother.smooth(landmarks_array)
+            landmarks = [
+                {"x": float(lm[0]), "y": float(lm[1]), "z": float(lm[2]), "visibility": float(lm[3])}
+                for lm in smoothed_array
+            ]
         
         # Extract world landmarks (3D in meters)
         world_landmarks = None
@@ -103,8 +215,23 @@ class PoseEstimator:
         
         return {
             "landmarks": landmarks,
-            "world_landmarks": world_landmarks
+            "world_landmarks": world_landmarks,
+            "process_time_ms": self.last_process_time * 1000
         }
+    
+    def get_performance_stats(self) -> dict:
+        """Get performance statistics."""
+        return {
+            "avg_process_time_ms": self.avg_process_time * 1000,
+            "last_process_time_ms": self.last_process_time * 1000,
+            "frames_processed": self.frame_count,
+            "estimated_max_fps": 1.0 / self.avg_process_time if self.avg_process_time > 0 else 0
+        }
+    
+    def reset_smoother(self):
+        """Reset pose smoother state."""
+        if self.smoother:
+            self.smoother.reset()
     
     def process_video(
         self, 

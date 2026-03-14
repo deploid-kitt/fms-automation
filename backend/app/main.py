@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from app.core.config import get_settings
 from app.api.routes import router
 from app.api.websocket import router as ws_router
+from app.api.llm_routes import router as llm_router
 
 # Configure logging
 logging.basicConfig(
@@ -64,6 +65,9 @@ def create_app() -> FastAPI:
     
     # Include WebSocket routes for live analysis
     app.include_router(ws_router)
+    
+    # Include LLM management routes
+    app.include_router(llm_router)
     
     # Root endpoint
     @app.get("/")

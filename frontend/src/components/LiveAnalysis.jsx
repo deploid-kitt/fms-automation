@@ -1,4 +1,5 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react'
+import ModelSettings from './ModelSettings'
 
 // WebSocket connection states
 const WS_STATE = {
@@ -24,19 +25,44 @@ const POSE_CONNECTIONS = [
   [0, 11], [0, 12], // nose to shoulders
 ]
 
-// Draw pose skeleton on canvas
+// Interpolate between two skeleton poses for smooth animation
+function interpolateSkeleton(prevSkeleton, nextSkeleton, t) {
+  if (!prevSkeleton || !nextSkeleton || prevSkeleton.length !== nextSkeleton.length) {
+    return nextSkeleton || prevSkeleton || []
+  }
+  
+  return nextSkeleton.map((point, idx) => {
+    const prev = prevSkeleton[idx]
+    if (!prev || prev.visibility < 0.3 || point.visibility < 0.3) {
+      return point
+    }
+    
+    return {
+      ...point,
+      x: prev.x + (point.x - prev.x) * t,
+      y: prev.y + (point.y - prev.y) * t,
+      z: prev.z + (point.z - prev.z) * t,
+    }
+  })
+}
+
+// Draw pose skeleton on canvas with optimizations
 function drawSkeleton(ctx, skeleton, problemJoints, width, height) {
   if (!skeleton || skeleton.length === 0) return
   
+  // Use willReadFrequently for performance
   ctx.clearRect(0, 0, width, height)
   
-  // Draw connections
+  // Draw connections with single path for performance
   ctx.lineWidth = 3
+  ctx.strokeStyle = '#00ff00'
+  ctx.lineCap = 'round'
+  ctx.lineJoin = 'round'
+  
   POSE_CONNECTIONS.forEach(([i, j]) => {
     const p1 = skeleton[i]
     const p2 = skeleton[j]
     if (p1 && p2 && p1.visibility > 0.5 && p2.visibility > 0.5) {
-      ctx.strokeStyle = '#00ff00'
       ctx.beginPath()
       ctx.moveTo(p1.x * width, p1.y * height)
       ctx.lineTo(p2.x * width, p2.y * height)
@@ -44,24 +70,30 @@ function drawSkeleton(ctx, skeleton, problemJoints, width, height) {
     }
   })
   
-  // Draw joints
+  // Draw joints - batch normal joints first
+  ctx.fillStyle = '#00ff00'
   skeleton.forEach((point, idx) => {
-    if (point.visibility > 0.5) {
-      const isProblem = problemJoints.includes(idx)
-      ctx.fillStyle = isProblem ? '#ff4444' : '#00ff00'
+    if (point.visibility > 0.5 && !problemJoints.includes(idx)) {
       ctx.beginPath()
-      ctx.arc(point.x * width, point.y * height, isProblem ? 8 : 5, 0, 2 * Math.PI)
+      ctx.arc(point.x * width, point.y * height, 5, 0, 2 * Math.PI)
       ctx.fill()
-      
-      // Add glow effect for problem joints
-      if (isProblem) {
-        ctx.shadowColor = '#ff4444'
-        ctx.shadowBlur = 15
-        ctx.fill()
-        ctx.shadowBlur = 0
-      }
     }
   })
+  
+  // Draw problem joints with glow effect
+  ctx.fillStyle = '#ff4444'
+  ctx.shadowColor = '#ff4444'
+  ctx.shadowBlur = 15
+  
+  skeleton.forEach((point, idx) => {
+    if (point.visibility > 0.5 && problemJoints.includes(idx)) {
+      ctx.beginPath()
+      ctx.arc(point.x * width, point.y * height, 8, 0, 2 * Math.PI)
+      ctx.fill()
+    }
+  })
+  
+  ctx.shadowBlur = 0
 }
 
 // Score indicator component
@@ -104,11 +136,21 @@ function FormQualityIndicator({ quality }) {
   )
 }
 
-// Coaching cue component
-function CoachingCue({ primary, secondary }) {
+// Coaching cue component with LLM support
+function CoachingCue({ primary, secondary, llmCue, llmModel }) {
+  const displayCue = llmCue || primary
+  const isLLMCue = !!llmCue
+  
   return (
     <div className="bg-white/90 backdrop-blur rounded-lg p-4 shadow-lg">
-      <p className="text-lg font-medium text-gray-800">{primary}</p>
+      <div className="flex items-start gap-2">
+        <p className="text-lg font-medium text-gray-800 flex-1">{displayCue}</p>
+        {isLLMCue && (
+          <span className="px-1.5 py-0.5 bg-purple-100 text-purple-700 text-xs rounded-full flex-shrink-0">
+            AI
+          </span>
+        )}
+      </div>
       {secondary && secondary.length > 0 && (
         <ul className="mt-2 space-y-1">
           {secondary.map((cue, idx) => (
@@ -118,6 +160,9 @@ function CoachingCue({ primary, secondary }) {
             </li>
           ))}
         </ul>
+      )}
+      {isLLMCue && llmModel && (
+        <p className="mt-2 text-xs text-gray-400">via {llmModel}</p>
       )}
     </div>
   )
@@ -139,6 +184,32 @@ function JointAngles({ angles }) {
           <span className="font-mono">{value}°</span>
         </div>
       ))}
+    </div>
+  )
+}
+
+// Performance monitor component
+function PerformanceMonitor({ fps, latency, serverProcessMs, visible }) {
+  if (!visible) return null
+  
+  return (
+    <div className="bg-black/70 text-white text-xs px-2 py-1 rounded font-mono space-y-0.5">
+      <div className="flex justify-between gap-3">
+        <span>Send FPS:</span>
+        <span className={fps < 10 ? 'text-red-400' : fps < 15 ? 'text-yellow-400' : 'text-green-400'}>
+          {fps}
+        </span>
+      </div>
+      <div className="flex justify-between gap-3">
+        <span>Latency:</span>
+        <span className={latency > 200 ? 'text-red-400' : latency > 100 ? 'text-yellow-400' : 'text-green-400'}>
+          {Math.round(latency)}ms
+        </span>
+      </div>
+      <div className="flex justify-between gap-3">
+        <span>Server:</span>
+        <span>{Math.round(serverProcessMs)}ms</span>
+      </div>
     </div>
   )
 }
@@ -173,6 +244,7 @@ export default function LiveAnalysis({ onBack }) {
   const wsRef = useRef(null)
   const streamRef = useRef(null)
   const animationRef = useRef(null)
+  const renderLoopRef = useRef(null)
   
   // State
   const [wsState, setWsState] = useState(WS_STATE.DISCONNECTED)
@@ -182,14 +254,87 @@ export default function LiveAnalysis({ onBack }) {
   const [feedback, setFeedback] = useState(null)
   const [finalResult, setFinalResult] = useState(null)
   const [cameraError, setCameraError] = useState(null)
-  const [fps, setFps] = useState(0)
+  const [showPerformance, setShowPerformance] = useState(true)
+  const [showModelSettings, setShowModelSettings] = useState(false)
   
-  // FPS tracking
+  // Performance metrics
+  const [fps, setFps] = useState(0)
+  const [latency, setLatency] = useState(0)
+  const [serverProcessMs, setServerProcessMs] = useState(0)
+  
+  // FPS and timing tracking
   const frameCountRef = useRef(0)
   const lastFpsTimeRef = useRef(Date.now())
+  const frameSequenceRef = useRef(0)
+  const frameSendTimesRef = useRef(new Map()) // Map sequence -> send timestamp
+  
+  // Skeleton interpolation state
+  const prevSkeletonRef = useRef(null)
+  const currentSkeletonRef = useRef(null)
+  const targetSkeletonRef = useRef(null)
+  const problemJointsRef = useRef([])
+  const lastSkeletonUpdateRef = useRef(0)
+  const interpolationStartRef = useRef(0)
   
   // Session ID
   const sessionIdRef = useRef(`live-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`)
+  
+  // Render loop for smooth skeleton animation
+  const startRenderLoop = useCallback(() => {
+    if (renderLoopRef.current) return
+    
+    const canvas = canvasRef.current
+    if (!canvas) return
+    
+    const ctx = canvas.getContext('2d', { willReadFrequently: false, alpha: true })
+    const INTERPOLATION_DURATION = 66 // ms between pose updates (adjust based on send FPS)
+    
+    const render = () => {
+      const now = performance.now()
+      
+      if (targetSkeletonRef.current && currentSkeletonRef.current) {
+        // Calculate interpolation progress
+        const elapsed = now - interpolationStartRef.current
+        const t = Math.min(elapsed / INTERPOLATION_DURATION, 1)
+        
+        // Ease-out interpolation for smoother motion
+        const easedT = 1 - Math.pow(1 - t, 2)
+        
+        const interpolated = interpolateSkeleton(
+          currentSkeletonRef.current,
+          targetSkeletonRef.current,
+          easedT
+        )
+        
+        drawSkeleton(
+          ctx,
+          interpolated,
+          problemJointsRef.current,
+          canvas.width,
+          canvas.height
+        )
+      } else if (currentSkeletonRef.current) {
+        drawSkeleton(
+          ctx,
+          currentSkeletonRef.current,
+          problemJointsRef.current,
+          canvas.width,
+          canvas.height
+        )
+      }
+      
+      renderLoopRef.current = requestAnimationFrame(render)
+    }
+    
+    renderLoopRef.current = requestAnimationFrame(render)
+  }, [])
+  
+  const stopRenderLoop = useCallback(() => {
+    if (renderLoopRef.current) {
+      cancelAnimationFrame(renderLoopRef.current)
+      renderLoopRef.current = null
+    }
+  }, [])
   
   // Fetch available exercises
   useEffect(() => {
@@ -199,14 +344,15 @@ export default function LiveAnalysis({ onBack }) {
       .catch(err => console.error('Failed to fetch exercises:', err))
   }, [])
   
-  // Start camera
+  // Start camera with optimized settings
   const startCamera = useCallback(async () => {
     try {
       setCameraError(null)
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
-          width: { ideal: 640 },
-          height: { ideal: 480 },
+          width: { ideal: 640, max: 640 },
+          height: { ideal: 480, max: 480 },
+          frameRate: { ideal: 30, max: 30 },
           facingMode: 'user'
         },
         audio: false
@@ -253,20 +399,39 @@ export default function LiveAnalysis({ onBack }) {
       
       if (data.type === 'started') {
         setIsAnalyzing(true)
+        startRenderLoop()
       } else if (data.type === 'feedback') {
         setFeedback(data)
         
-        // Draw skeleton overlay
-        if (canvasRef.current && data.skeleton) {
-          const ctx = canvasRef.current.getContext('2d')
-          drawSkeleton(
-            ctx, 
-            data.skeleton, 
-            data.problem_joints || [],
-            canvasRef.current.width,
-            canvasRef.current.height
-          )
+        // Calculate round-trip latency
+        const sequence = data.frame_sequence
+        if (frameSendTimesRef.current.has(sequence)) {
+          const sendTime = frameSendTimesRef.current.get(sequence)
+          const rtt = performance.now() - sendTime
+          setLatency(prev => prev * 0.8 + rtt * 0.2) // Smooth latency
+          frameSendTimesRef.current.delete(sequence)
+          
+          // Clean up old entries
+          if (frameSendTimesRef.current.size > 100) {
+            const keys = Array.from(frameSendTimesRef.current.keys()).slice(0, 50)
+            keys.forEach(k => frameSendTimesRef.current.delete(k))
+          }
         }
+        
+        // Update server processing time
+        if (data.server_process_ms) {
+          setServerProcessMs(prev => prev * 0.8 + data.server_process_ms * 0.2)
+        }
+        
+        // Update skeleton for interpolation
+        if (data.skeleton && data.skeleton.length > 0) {
+          prevSkeletonRef.current = currentSkeletonRef.current
+          currentSkeletonRef.current = targetSkeletonRef.current || data.skeleton
+          targetSkeletonRef.current = data.skeleton
+          interpolationStartRef.current = performance.now()
+        }
+        
+        problemJointsRef.current = data.problem_joints || []
         
         // Handle audio cues (using Web Speech API)
         if (data.audio_cue && data.audio_priority >= 2) {
@@ -274,9 +439,14 @@ export default function LiveAnalysis({ onBack }) {
         }
       } else if (data.type === 'stopped') {
         setIsAnalyzing(false)
+        stopRenderLoop()
         setFinalResult(data)
       } else if (data.type === 'exercise_changed') {
         console.log('Exercise changed to:', data.exercise)
+        // Reset skeleton state
+        prevSkeletonRef.current = null
+        currentSkeletonRef.current = null
+        targetSkeletonRef.current = null
       }
     }
     
@@ -288,10 +458,11 @@ export default function LiveAnalysis({ onBack }) {
     ws.onclose = () => {
       setWsState(WS_STATE.DISCONNECTED)
       setIsAnalyzing(false)
+      stopRenderLoop()
     }
     
     wsRef.current = ws
-  }, [])
+  }, [startRenderLoop, stopRenderLoop])
   
   // Disconnect WebSocket
   const disconnectWebSocket = useCallback(() => {
@@ -301,32 +472,46 @@ export default function LiveAnalysis({ onBack }) {
     }
   }, [])
   
-  // Send frame to server
+  // Reusable canvas for frame capture
+  const captureCanvasRef = useRef(null)
+  
+  // Send frame to server with timing info
   const sendFrame = useCallback(() => {
     if (!videoRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
       return
     }
     
-    // Create temporary canvas for frame capture
-    const tempCanvas = document.createElement('canvas')
-    tempCanvas.width = 640
-    tempCanvas.height = 480
-    const ctx = tempCanvas.getContext('2d')
+    // Reuse canvas for performance
+    if (!captureCanvasRef.current) {
+      captureCanvasRef.current = document.createElement('canvas')
+      captureCanvasRef.current.width = 640
+      captureCanvasRef.current.height = 480
+    }
+    
+    const tempCanvas = captureCanvasRef.current
+    const ctx = tempCanvas.getContext('2d', { willReadFrequently: false })
     
     // Draw mirrored video frame
-    ctx.translate(tempCanvas.width, 0)
-    ctx.scale(-1, 1)
+    ctx.setTransform(-1, 0, 0, 1, tempCanvas.width, 0)
     ctx.drawImage(videoRef.current, 0, 0, tempCanvas.width, tempCanvas.height)
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
     
-    // Convert to JPEG and send
-    const frameData = tempCanvas.toDataURL('image/jpeg', 0.7)
+    // Convert to JPEG with reduced quality for faster transfer
+    const frameData = tempCanvas.toDataURL('image/jpeg', 0.6)
+    
+    // Track timing
+    const sequence = frameSequenceRef.current++
+    const sendTime = performance.now()
+    frameSendTimesRef.current.set(sequence, sendTime)
     
     wsRef.current.send(JSON.stringify({
       type: 'frame',
-      data: frameData
+      data: frameData,
+      timestamp: Date.now(),
+      sequence: sequence
     }))
     
-    // Track FPS
+    // Track send FPS
     frameCountRef.current++
     const now = Date.now()
     if (now - lastFpsTimeRef.current >= 1000) {
@@ -336,10 +521,10 @@ export default function LiveAnalysis({ onBack }) {
     }
   }, [])
   
-  // Animation loop for sending frames
+  // Animation loop for sending frames at controlled rate
   const startFrameLoop = useCallback(() => {
     let lastFrameTime = 0
-    const targetFPS = 15 // Send 15 frames per second
+    const targetFPS = 15 // Send 15 frames per second for real-time performance
     const frameInterval = 1000 / targetFPS
     
     const loop = (timestamp) => {
@@ -361,10 +546,13 @@ export default function LiveAnalysis({ onBack }) {
     }
   }, [])
   
-  // Text-to-speech for audio cues
+  // Text-to-speech for audio cues (with rate limiting)
+  const lastSpeakTimeRef = useRef(0)
   const speakCue = useCallback((text) => {
+    const now = Date.now()
+    if (now - lastSpeakTimeRef.current < 2000) return // 2 second cooldown
+    
     if ('speechSynthesis' in window) {
-      // Cancel any ongoing speech
       window.speechSynthesis.cancel()
       
       const utterance = new SpeechSynthesisUtterance(text)
@@ -373,6 +561,7 @@ export default function LiveAnalysis({ onBack }) {
       utterance.volume = 0.8
       
       window.speechSynthesis.speak(utterance)
+      lastSpeakTimeRef.current = now
     }
   }, [])
   
@@ -380,6 +569,14 @@ export default function LiveAnalysis({ onBack }) {
   const handleStart = useCallback(async () => {
     setFinalResult(null)
     setFeedback(null)
+    
+    // Reset skeleton state
+    prevSkeletonRef.current = null
+    currentSkeletonRef.current = null
+    targetSkeletonRef.current = null
+    problemJointsRef.current = []
+    frameSequenceRef.current = 0
+    frameSendTimesRef.current.clear()
     
     // Start camera if not already started
     if (!streamRef.current) {
@@ -406,6 +603,7 @@ export default function LiveAnalysis({ onBack }) {
   // Stop analysis
   const handleStop = useCallback(() => {
     stopFrameLoop()
+    stopRenderLoop()
     
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'stop' }))
@@ -418,7 +616,12 @@ export default function LiveAnalysis({ onBack }) {
       const ctx = canvasRef.current.getContext('2d')
       ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height)
     }
-  }, [stopFrameLoop])
+    
+    // Reset skeleton state
+    prevSkeletonRef.current = null
+    currentSkeletonRef.current = null
+    targetSkeletonRef.current = null
+  }, [stopFrameLoop, stopRenderLoop])
   
   // Change exercise
   const handleExerciseChange = useCallback((exerciseId) => {
@@ -436,10 +639,11 @@ export default function LiveAnalysis({ onBack }) {
   useEffect(() => {
     return () => {
       stopFrameLoop()
+      stopRenderLoop()
       stopCamera()
       disconnectWebSocket()
     }
-  }, [stopFrameLoop, stopCamera, disconnectWebSocket])
+  }, [stopFrameLoop, stopRenderLoop, stopCamera, disconnectWebSocket])
   
   // Initialize camera on mount
   useEffect(() => {
@@ -458,15 +662,33 @@ export default function LiveAnalysis({ onBack }) {
             <h2 className="text-xl font-bold text-gray-800">Live FMS Analysis</h2>
             <p className="text-sm text-gray-500">Real-time movement coaching</p>
           </div>
-          <button
-            onClick={onBack}
-            className="text-gray-600 hover:text-gray-800 flex items-center gap-2"
-          >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
-            </svg>
-            Back
-          </button>
+          <div className="flex items-center gap-4">
+            <button
+              onClick={() => setShowPerformance(!showPerformance)}
+              className="text-xs text-gray-500 hover:text-gray-700"
+            >
+              {showPerformance ? 'Hide' : 'Show'} Stats
+            </button>
+            <button
+              onClick={() => setShowModelSettings(true)}
+              className="text-gray-600 hover:text-gray-800 flex items-center gap-2"
+              title="AI Model Settings"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+              </svg>
+            </button>
+            <button
+              onClick={onBack}
+              className="text-gray-600 hover:text-gray-800 flex items-center gap-2"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+              </svg>
+              Back
+            </button>
+          </div>
         </div>
       </div>
       
@@ -534,11 +756,14 @@ export default function LiveAnalysis({ onBack }) {
               {isAnalyzing ? 'Analyzing' : wsState === WS_STATE.CONNECTED ? 'Ready' : wsState}
             </div>
             
-            {/* FPS */}
+            {/* Performance Monitor */}
             {isAnalyzing && (
-              <div className="bg-black/50 text-white text-xs px-2 py-1 rounded">
-                {fps} FPS
-              </div>
+              <PerformanceMonitor
+                fps={fps}
+                latency={latency}
+                serverProcessMs={serverProcessMs}
+                visible={showPerformance}
+              />
             )}
           </div>
           
@@ -562,6 +787,8 @@ export default function LiveAnalysis({ onBack }) {
               <CoachingCue 
                 primary={feedback.primary_cue} 
                 secondary={feedback.secondary_cues}
+                llmCue={feedback.llm_cue}
+                llmModel={feedback.llm_model}
               />
             </div>
           )}
@@ -643,6 +870,15 @@ export default function LiveAnalysis({ onBack }) {
           </div>
         )}
       </div>
+      
+      {/* Model Settings Modal */}
+      <ModelSettings
+        isOpen={showModelSettings}
+        onClose={() => setShowModelSettings(false)}
+        onSave={(prefs) => {
+          console.log('Model preferences saved:', prefs)
+        }}
+      />
     </div>
   )
 }

@@ -26,6 +26,13 @@ services:
       # WebSocket settings
       FMS_WS_HEARTBEAT_INTERVAL: "30"
       FMS_WS_MAX_CONNECTIONS: "50"
+      # Pose estimation performance settings
+      FMS_POSE_MODEL_COMPLEXITY: "1"  # 0=lite, 1=full, 2=heavy
+      FMS_LIVE_FRAME_SKIP: "2"        # Process every Nth frame
+      FMS_LIVE_PROCESS_WIDTH: "320"   # Downscale width for pose processing
+      FMS_LIVE_PROCESS_HEIGHT: "240"  # Downscale height for pose processing
+      FMS_POSE_SMOOTHING_ENABLED: "true"
+      FMS_POSE_SMOOTHING_FACTOR: "0.5"
     volumes:
       - uploads_data:/app/data/uploads
       - models_data:/app/models
