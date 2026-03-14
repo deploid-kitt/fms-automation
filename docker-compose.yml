@@ -1,0 +1,75 @@
+services:
+  # Redis for caching and job queue (future use)
+  redis:
+    image: redis:7-alpine
+    container_name: fms-redis
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Backend API (with WebSocket support for live analysis)
+  backend:
+    build: ./backend
+    container_name: fms-backend
+    environment:
+      FMS_DEBUG: "false"
+      FMS_HOST: "0.0.0.0"
+      FMS_PORT: "8000"
+      FMS_REDIS_URL: "redis://redis:6379/0"
+      FMS_UPLOAD_DIR: "/app/data/uploads"
+      FMS_MODELS_DIR: "/app/models"
+      # WebSocket settings
+      FMS_WS_HEARTBEAT_INTERVAL: "30"
+      FMS_WS_MAX_CONNECTIONS: "50"
+    volumes:
+      - uploads_data:/app/data/uploads
+      - models_data:/app/models
+    ports:
+      - "127.0.0.1:8010:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    restart: unless-stopped
+    # Resource limits for production (increased for live processing)
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+        reservations:
+          memory: 3G
+
+  # Frontend
+  frontend:
+    build: ./frontend
+    container_name: fms-frontend
+    ports:
+      - "127.0.0.1:8011:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  uploads_data:
+  models_data:
+
+networks:
+  default:
+    name: fms-network

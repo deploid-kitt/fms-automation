@@ -1,0 +1,100 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+}
+
+.upload-zone {
+  @apply border-2 border-dashed border-gray-300 rounded-xl p-8 text-center cursor-pointer
+         transition-all duration-200 ease-in-out;
+}
+
+.upload-zone:hover {
+  @apply border-primary-500 bg-primary-50;
+}
+
+.upload-zone.dragging {
+  @apply border-primary-600 bg-primary-100 scale-[1.02];
+}
+
+.score-badge {
+  @apply inline-flex items-center justify-center w-10 h-10 rounded-full font-bold text-lg;
+}
+
+.score-3 { @apply bg-green-100 text-green-700; }
+.score-2 { @apply bg-yellow-100 text-yellow-700; }
+.score-1 { @apply bg-red-100 text-red-700; }
+.score-0 { @apply bg-gray-100 text-gray-700; }
+
+/* Live Analysis Styles */
+.live-video-container {
+  @apply relative bg-black rounded-xl overflow-hidden;
+  aspect-ratio: 4/3;
+}
+
+.pose-overlay {
+  @apply absolute inset-0 w-full h-full pointer-events-none;
+}
+
+.coaching-cue {
+  @apply bg-white/90 backdrop-blur rounded-lg p-4 shadow-lg;
+  animation: slideIn 0.3s ease-out;
+}
+
+@keyframes slideIn {
+  from {
+    transform: translateY(10px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 5px 0 rgba(34, 197, 94, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 20px 5px rgba(34, 197, 94, 0.8);
+  }
+}
+
+.score-glow-excellent {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+/* Status badge animations */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.status-analyzing {
+  animation: blink 1s ease-in-out infinite;
+}
+
+/* Form quality indicator */
+.form-quality-excellent { @apply bg-green-100 text-green-700 border-green-300; }
+.form-quality-good { @apply bg-blue-100 text-blue-700 border-blue-300; }
+.form-quality-needs_work { @apply bg-yellow-100 text-yellow-700 border-yellow-300; }
+.form-quality-poor { @apply bg-red-100 text-red-700 border-red-300; }
+
+/* Problem joint highlight */
+@keyframes problem-pulse {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+  }
+  50% {
+    transform: scale(1.2);
+    box-shadow: 0 0 10px 5px rgba(239, 68, 68, 0.3);
+  }
+}
+
+.problem-joint {
+  animation: problem-pulse 0.8s ease-in-out infinite;
+}
