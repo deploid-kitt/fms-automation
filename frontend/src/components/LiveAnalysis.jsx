@@ -66,8 +66,9 @@ function drawSkeleton(ctx, skeleton, problemJoints, width, height) {
     const p2 = skeleton[j]
     if (p1 && p2 && p1.visibility > 0.5 && p2.visibility > 0.5) {
       ctx.beginPath()
-      ctx.moveTo(p1.x * width, p1.y * height)
-      ctx.lineTo(p2.x * width, p2.y * height)
+      // Flip X coordinates to match video mirroring
+      ctx.moveTo((1 - p1.x) * width, p1.y * height)
+      ctx.lineTo((1 - p2.x) * width, p2.y * height)
       ctx.stroke()
     }
   })
@@ -77,7 +78,8 @@ function drawSkeleton(ctx, skeleton, problemJoints, width, height) {
   skeleton.forEach((point, idx) => {
     if (point.visibility > 0.5 && !problemJoints.includes(idx)) {
       ctx.beginPath()
-      ctx.arc(point.x * width, point.y * height, 5, 0, 2 * Math.PI)
+      // Flip X coordinates to match video mirroring
+      ctx.arc((1 - point.x) * width, point.y * height, 5, 0, 2 * Math.PI)
       ctx.fill()
     }
   })
@@ -90,7 +92,8 @@ function drawSkeleton(ctx, skeleton, problemJoints, width, height) {
   skeleton.forEach((point, idx) => {
     if (point.visibility > 0.5 && problemJoints.includes(idx)) {
       ctx.beginPath()
-      ctx.arc(point.x * width, point.y * height, 8, 0, 2 * Math.PI)
+      // Flip X coordinates to match video mirroring
+      ctx.arc((1 - point.x) * width, point.y * height, 8, 0, 2 * Math.PI)
       ctx.fill()
     }
   })
